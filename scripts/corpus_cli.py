@@ -261,7 +261,14 @@ def cmd_coordinator(args: argparse.Namespace) -> None:
     async def _run():
         storage = EnvStorageService()
         await storage.initialize()
-        coordinator = ScrapeCoordinator(storage)
+        coordinator = ScrapeCoordinator(
+            storage,
+            enrichment_batch_size=getattr(args, 'enrichment_batch_size', 50),
+            rate_limit=getattr(args, 'rate_limit', 2.0),
+            max_concurrent=getattr(args, 'max_concurrent', 20),
+            source_timeout=getattr(args, 'source_timeout', 300),
+            checkpoint_interval=getattr(args, 'checkpoint_interval', 300),
+        )
 
         # Signal handling for graceful shutdown
         loop = asyncio.get_running_loop()
@@ -285,6 +292,7 @@ def cmd_coordinator(args: argparse.Namespace) -> None:
                     govt_registry_groups=args.govt_groups,
                     output_dir=output_dir,
                     log_file=log_file,
+                    num_sources=args.num_sources,
                 )
             else:
                 await coordinator.start(
@@ -298,6 +306,7 @@ def cmd_coordinator(args: argparse.Namespace) -> None:
                     run_id=run_id,
                     output_dir=output_dir,
                     log_file=log_file,
+                    num_sources=args.num_sources,
                 )
 
             # Wait for the coordinator task to finish
@@ -457,11 +466,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated groups from registry",
     )
     p_coord.add_argument("--gzip", action="store_true", help="Compress output")
+    p_coord.add_argument("--num-sources", type=int, help="Limit number of sources to scrape")
     p_coord.add_argument(
         "--resume",
         metavar="RUN_ID",
         help="Resume an interrupted run by its run_id",
     )
+    # Production tuning flags
+    p_coord.add_argument("--rate-limit", type=float, default=2.0,
+                         dest="rate_limit",
+                         help="Max requests/sec per domain (default: 2.0)")
+    p_coord.add_argument("--max-concurrent", type=int, default=20,
+                         dest="max_concurrent",
+                         help="Max total concurrent requests (default: 20)")
+    p_coord.add_argument("--source-timeout", type=int, default=300,
+                         dest="source_timeout",
+                         help="Per-source timeout in seconds (default: 300)")
+    p_coord.add_argument("--enrichment-batch-size", type=int, default=50,
+                         dest="enrichment_batch_size",
+                         help="Records to buffer before triggering enrichment (default: 50)")
+    p_coord.add_argument("--checkpoint-interval", type=int, default=300,
+                         dest="checkpoint_interval",
+                         help="Seconds between periodic checkpoints (default: 300)")
     p_coord.set_defaults(func=cmd_coordinator)
 
     return parser

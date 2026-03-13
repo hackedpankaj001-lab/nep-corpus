@@ -167,7 +167,7 @@ logger = logging.getLogger(__name__)
 def enrich_records(
     records: Iterable[RawRecord],
     cache_dir: str,
-    min_enrich_len: int = 200,
+    min_enrich_len: int = 1000,
     max_workers: int = 10,
 ) -> List[Tuple[RawRecord, Optional[str]]]:
     """Parallel enrichment using ThreadPoolExecutor."""
