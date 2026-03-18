@@ -119,7 +119,8 @@ def append_url_cache(cache_path: str, urls: list[str]) -> None:
 
 
 async def stream_training_documents(session, columns: str, batch_size: int):
-    last_id = 0
+    # training_documents.id is TEXT, so keep the cursor as string
+    last_id = ""
     while True:
         query = f"""
             SELECT {columns}
@@ -131,7 +132,7 @@ async def stream_training_documents(session, columns: str, batch_size: int):
         rows = await session.service._db.fetch(query, last_id, batch_size)
         if not rows:
             break
-        last_id = rows[-1]["id"]
+        last_id = str(rows[-1]["id"])
         yield rows
 
 

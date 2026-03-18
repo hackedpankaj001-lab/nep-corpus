@@ -357,6 +357,8 @@ def cmd_rerun_failed(args: argparse.Namespace) -> None:
             storage,
             enrichment_workers=args.enrichment_workers,
             enrichment_batch_size=args.batch_size,
+            rate_limit=args.rate_limit,
+            max_concurrent=args.max_concurrent,
             ocr_enabled=getattr(args, "ocr", False),
             pdf_enabled=getattr(args, "pdf", False),
         )
@@ -549,6 +551,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_rerun.add_argument("--batch-size", type=int, default=50,
                           dest="batch_size",
                           help="Batch size for DB updates (default: 50)")
+    p_rerun.add_argument("--rate-limit", type=float, default=2.0,
+                          dest="rate_limit",
+                          help="Max requests/sec per domain (default: 2.0)")
+    p_rerun.add_argument("--max-concurrent", type=int, default=20,
+                          dest="max_concurrent",
+                          help="Max total concurrent requests (default: 20)")
     p_rerun.add_argument("--limit", type=int, default=0,
                           help="Limit records to process (default: 0, no limit)")
     p_rerun.add_argument("--log-file", default="data/rerun_failed.log",
