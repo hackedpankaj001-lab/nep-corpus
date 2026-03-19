@@ -67,6 +67,13 @@ TEXT_CANDIDATES = [
 ]
 
 
+def make_doc_id(repo_id: str, file_path: str, row_idx: int) -> str:
+    import hashlib
+
+    raw = f"{repo_id}|{file_path}|{row_idx}"
+    return hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()
+
+
 def iter_inventory(path: str) -> Iterator[Dict[str, Any]]:
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
@@ -150,6 +157,15 @@ def iter_text_from_json(path: str) -> Iterator[str]:
                         yield item[col]
 
 
+def _markdown_table(headers: List[str], values: List[str]) -> str:
+    safe_headers = [h.strip() or "col" for h in headers]
+    safe_values = [v.strip() for v in values]
+    header_row = "| " + " | ".join(safe_headers) + " |"
+    sep_row = "| " + " | ".join(["---"] * len(safe_headers)) + " |"
+    val_row = "| " + " | ".join(safe_values) + " |"
+    return "\n".join([header_row, sep_row, val_row])
+
+
 def iter_text_from_csv(path: str) -> Iterator[str]:
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         try:
@@ -162,24 +178,31 @@ def iter_text_from_csv(path: str) -> Iterator[str]:
         if not reader.fieldnames:
             return
         text_col = select_text_column(reader.fieldnames)
-        if not text_col:
-            return
         for row in reader:
-            val = row.get(text_col)
-            if isinstance(val, str) and val.strip():
-                yield val
+            if text_col:
+                val = row.get(text_col)
+                if isinstance(val, str) and val.strip():
+                    yield val
+            else:
+                values = [str(row.get(h, "") or "") for h in reader.fieldnames]
+                yield _markdown_table(reader.fieldnames, values)
 
 
 def iter_text_from_parquet(path: str) -> Iterator[str]:
     pf = pq.ParquetFile(path)
     cols = pf.schema.names
     text_col = select_text_column(cols)
-    if not text_col:
-        return
-    for batch in pf.iter_batches(columns=[text_col]):
-        for val in batch.column(0).to_pylist():
-            if isinstance(val, str) and val.strip():
-                yield val
+    if text_col:
+        for batch in pf.iter_batches(columns=[text_col]):
+            for val in batch.column(0).to_pylist():
+                if isinstance(val, str) and val.strip():
+                    yield val
+    else:
+        for batch in pf.iter_batches(columns=cols):
+            rows = batch.to_pylist()
+            for row in rows:
+                values = [str(row.get(h, "") or "") for h in cols]
+                yield _markdown_table(cols, values)
 
 
 def iter_text_from_file(path: str) -> Iterator[str]:
@@ -257,6 +280,7 @@ def main() -> None:
     parser.add_argument("--keep-files", action="store_true", help="Keep downloaded files")
     parser.add_argument("--include-review", action="store_true", help="Include review datasets too")
     parser.add_argument("--filter-json", help="Path to JSON filter spec override")
+    parser.add_argument("--no-tabular-markdown", action="store_true", help="Skip tabular->markdown conversion")
     args = parser.parse_args()
 
     api = KaggleApi()
@@ -315,7 +339,10 @@ def main() -> None:
                 continue
 
             for file_path in files:
-                for text in iter_text_from_file(file_path):
+                lower = file_path.lower()
+                if args.no_tabular_markdown and (lower.endswith(".csv") or lower.endswith(".tsv") or lower.endswith(".parquet")):
+                    continue
+                for row_idx, text in enumerate(iter_text_from_file(file_path)):
                     text_norm = normalize_text(text)
                     if not text_norm:
                         continue
@@ -324,9 +351,9 @@ def main() -> None:
                     doc = {
                         "text": text_norm,
                         "source": f"kaggle:{repo_id}",
-                        "url": None,
+                        "url": f"https://www.kaggle.com/datasets/{repo_id}",
                         "language": "ne",
-                        "doc_id": None,
+                        "doc_id": make_doc_id(repo_id, file_path, row_idx),
                     }
                     h = hash_text(text_norm)
                     pending.append((h, doc))
