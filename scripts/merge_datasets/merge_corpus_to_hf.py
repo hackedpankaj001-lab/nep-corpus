@@ -16,12 +16,14 @@ import os
 import re
 import sqlite3
 import sys
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import yaml
 from datasets import Dataset, Features, Value, load_dataset
+import datasets
 from huggingface_hub import HfApi, get_token, login
 
 # Ensure project root is on sys.path for scripts.* imports
@@ -91,6 +93,7 @@ class SourceConfig:
     name: str
     kind: str
     repo: Optional[str] = None
+    config: Optional[str] = None
     split: str = "train"
     path: Optional[str] = None
     fields: Optional[Dict[str, Any]] = None
@@ -147,8 +150,11 @@ class DedupeStore:
         return [(h, row) for h, row in unique_items if h not in existing]
 
 
-def iter_hf_dataset(repo: str, split: str = "train") -> Iterator[Dict[str, Any]]:
-    dataset = load_dataset(repo, split=split, streaming=True)
+def iter_hf_dataset(repo: str, split: str = "train", config: Optional[str] = None) -> Iterator[Dict[str, Any]]:
+    if config:
+        dataset = load_dataset(repo, name=config, split=split, streaming=True)
+    else:
+        dataset = load_dataset(repo, split=split, streaming=True)
     for row in dataset:
         yield row
 
@@ -244,6 +250,7 @@ def parse_sources(raw_sources: List[Dict[str, Any]]) -> List[SourceConfig]:
                 name=name,
                 kind=kind,
                 repo=raw.get("repo"),
+                config=raw.get("config"),
                 split=raw.get("split", "train"),
                 path=raw.get("path"),
                 fields=raw.get("fields") or {},
@@ -251,6 +258,63 @@ def parse_sources(raw_sources: List[Dict[str, Any]]) -> List[SourceConfig]:
             )
         )
     return sources
+
+
+def load_inventory_sources(
+    inventory_path: str,
+    include_re: Optional[re.Pattern],
+    exclude_re: Optional[re.Pattern],
+) -> List[SourceConfig]:
+    sources: List[SourceConfig] = []
+    with open(inventory_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            repo_id = row.get("repo_id")
+            config = row.get("config") or "default"
+            split = row.get("split") or "train"
+            mapping = row.get("mapping_suggested") or {}
+            usable = row.get("usable", False)
+            if not repo_id or not usable or not mapping.get("text"):
+                continue
+
+            if include_re and not include_re.search(repo_id):
+                continue
+            if exclude_re and exclude_re.search(repo_id):
+                continue
+
+            source_name = repo_id if config == "default" else f"{repo_id}:{config}"
+            sources.append(
+                SourceConfig(
+                    name=source_name,
+                    kind="hf",
+                    repo=repo_id,
+                    config=config,
+                    split=split,
+                    fields={k: v for k, v in mapping.items() if v},
+                    filters=row.get("filters") or None,
+                )
+            )
+    return sources
+
+
+def cleanup_hf_cache(repo_id: str) -> None:
+    cache_root = os.environ.get("HF_DATASETS_CACHE") or datasets.config.HF_DATASETS_CACHE
+    if not cache_root or not os.path.isdir(cache_root):
+        return
+    safe = repo_id.replace("/", "___")
+    for entry in os.listdir(cache_root):
+        if entry.startswith(safe):
+            try:
+                path = os.path.join(cache_root, entry)
+                shutil.rmtree(path, ignore_errors=True)
+            except Exception:
+                continue
 
 
 def map_item_to_schema(
@@ -367,7 +431,7 @@ def iter_source_items(source: SourceConfig) -> Iterator[Dict[str, Any]]:
     if source.kind == "hf":
         if not source.repo:
             raise ValueError(f"HF source missing repo: {source.name}")
-        yield from iter_hf_dataset(source.repo, split=source.split)
+        yield from iter_hf_dataset(source.repo, split=source.split, config=source.config)
     elif source.kind == "jsonl":
         if not source.path:
             raise ValueError(f"JSONL source missing path: {source.name}")
@@ -420,6 +484,7 @@ def merge_and_upload(
     global_filter_spec: Optional[FilterSpec],
     legacy_filter_spec: Optional[FilterSpec],
     default_language: Optional[str],
+    cleanup_cache: bool,
 ) -> None:
     api = HfApi()
 
@@ -537,6 +602,9 @@ def merge_and_upload(
                         logger.info("Reached max_batches=%s. Stopping early.", max_batches)
                         return
 
+            if cleanup_cache and source.kind == "hf" and source.repo:
+                cleanup_hf_cache(source.repo)
+
         if pending:
             new_pairs = store.filter_new(pending)
             pending = []
@@ -584,6 +652,11 @@ def main() -> None:
         action="append",
         help="Only process specific dataset(s) by source name or repo (can be repeated)",
     )
+    parser.add_argument("--inventory", help="Inventory JSONL path (from hf_inventory.py)")
+    parser.add_argument("--include-regex", help="Regex to include repos from inventory")
+    parser.add_argument("--exclude-regex", help="Regex to exclude repos from inventory")
+    parser.add_argument("--cleanup-cache", action="store_true", default=None, help="Delete HF cache per source")
+    parser.add_argument("--no-cleanup-cache", action="store_false", dest="cleanup_cache", default=None)
 
     args = parser.parse_args()
 
@@ -595,8 +668,25 @@ def main() -> None:
 
     raw_sources = config.get("sources") or []
     sources = parse_sources(raw_sources)
+
+    include_re = re.compile(args.include_regex) if args.include_regex else None
+    exclude_re = re.compile(args.exclude_regex) if args.exclude_regex else None
+    if args.inventory:
+        inventory_sources = load_inventory_sources(args.inventory, include_re, exclude_re)
+        if inventory_sources:
+            # Allow config sources to override inventory entries
+            merged = list(inventory_sources)
+            index = {(s.repo, s.config): i for i, s in enumerate(merged)}
+            for s in sources:
+                key = (s.repo, s.config)
+                if key in index:
+                    merged[index[key]] = s
+                else:
+                    merged.append(s)
+            sources = merged
+
     if not sources:
-        print("Error: No sources configured. Add `sources:` to the config.")
+        print("Error: No sources configured. Add `sources:` or provide --inventory.")
         sys.exit(1)
 
     if args.dataset:
@@ -618,6 +708,7 @@ def main() -> None:
     if global_filter_spec is None:
         legacy_filter_spec = build_legacy_filter_spec(options)
     default_language = options.get("default_language")
+    cleanup_cache = args.cleanup_cache if args.cleanup_cache is not None else options.get("cleanup_cache", True)
 
     dedupe_store = (
         args.dedupe_store
@@ -632,6 +723,9 @@ def main() -> None:
 
     login(token=token)
 
+    if cleanup_cache:
+        datasets.disable_caching()
+
     merge_and_upload(
         sources=sources,
         repo_id=target_repo,
@@ -644,6 +738,7 @@ def main() -> None:
         global_filter_spec=global_filter_spec,
         legacy_filter_spec=legacy_filter_spec,
         default_language=default_language,
+        cleanup_cache=cleanup_cache,
     )
 
 
