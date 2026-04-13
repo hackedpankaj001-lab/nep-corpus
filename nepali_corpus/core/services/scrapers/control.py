@@ -30,6 +30,7 @@ from nepali_corpus.core.utils import JsonlWriter
 from nepali_corpus.core.utils.boilerplate import BoilerplateDetector
 from nepali_corpus.core.utils.content_types import identify_content_type
 from nepali_corpus.core.utils.rate_limiter import DomainRateLimiter
+from nepali_corpus.core.utils.url_set import UrlSet
 from nepali_corpus.pipeline.runner import enrich_records, to_training_docs
 
 logger = logging.getLogger("nepali_corpus.scrapers.control")
@@ -147,13 +148,15 @@ class ScrapeCoordinator:
         self._pdf_enabled = pdf_enabled
         self._source_timeout = source_timeout
         self._checkpoint_interval = checkpoint_interval
-        self._visited_urls: Set[str] = set()  # In-memory fast dedup
+        self._visited_urls = UrlSet()
         self._boilerplate_detector = BoilerplateDetector()
         self._rate_limiter = DomainRateLimiter(
             default_rate=rate_limit,
             max_concurrent=max_concurrent,
         )
         self._checkpoint_task: Optional[asyncio.Task] = None
+        self._enrichment_tasks: Set[asyncio.Task] = set()
+        self._enrichment_task_sem = asyncio.Semaphore(max(1, enrichment_workers))
 
     def is_running(self) -> bool:
         return self.state.running
@@ -173,7 +176,7 @@ class ScrapeCoordinator:
                     rows = await session.service._db.fetch(
                         "SELECT url FROM training_documents"
                     )
-                    self._visited_urls = {row[0] for row in rows}
+                    self._visited_urls.add_many(row[0] for row in rows)
                     logger.info("Loaded %d successful URLs to skip", len(self._visited_urls))
                 return
 
@@ -185,10 +188,35 @@ class ScrapeCoordinator:
                     rows = await session.service._db.fetch(
                         "SELECT url FROM visited_urls"
                     )
-                    self._visited_urls = {row[0] for row in rows}
+                    self._visited_urls.add_many(row[0] for row in rows)
                     logger.info("Loaded %d visited URLs", len(self._visited_urls))
         except Exception as e:
             logger.warning("Could not preload visited URLs: %s", e)
+
+    def _schedule_enrichment(self, session: Any, records: List[RawRecord]) -> None:
+        """Schedule enrichment in tracked background tasks with bounded concurrency."""
+        if not records:
+            return
+
+        async def _runner() -> None:
+            async with self._enrichment_task_sem:
+                await self._process_immediate_enrichment(session, records)
+
+        task = asyncio.create_task(_runner())
+        self._enrichment_tasks.add(task)
+        task.add_done_callback(self._enrichment_tasks.discard)
+
+    async def _drain_enrichment_tasks(self) -> None:
+        """Wait for all scheduled enrichment tasks to finish."""
+        if not self._enrichment_tasks:
+            return
+
+        pending = list(self._enrichment_tasks)
+        logger.info("Waiting for %d enrichment tasks to finish", len(pending))
+        results = await asyncio.gather(*pending, return_exceptions=True)
+        for res in results:
+            if isinstance(res, Exception):
+                logger.error("Background enrichment task failed: %s", res)
 
     async def _maybe_flush_enrichment(self, session: Any, force: bool = False) -> None:
         """Drain enrichment buffer and run enrichment if threshold met."""
@@ -203,7 +231,7 @@ class ScrapeCoordinator:
 
         if batch:
             logger.info("Flushing enrichment batch of %d records", len(batch))
-            asyncio.create_task(self._process_immediate_enrichment(session, batch))
+            self._schedule_enrichment(session, batch)
 
     async def _periodic_checkpoint(self, output_dir: str) -> None:
         """Background task to write checkpoints at regular intervals."""
@@ -717,6 +745,7 @@ class ScrapeCoordinator:
 
         # --- Flush remaining enrichment buffer ---
         await self._maybe_flush_enrichment(session, force=True)
+        await self._drain_enrichment_tasks()
 
         # --- Enrichment Phase ---
         if not self._stop_event.is_set() and self.state.urls_crawled > 0:
@@ -817,6 +846,8 @@ class ScrapeCoordinator:
         # --- Enrichment Phase (for any items that need it) ---
         if not self._stop_event.is_set():
             await self._run_enrichment(session, output_path, gzip_output, workers)
+
+        await self._drain_enrichment_tasks()
 
         await self._finalize_run(session)
         self._cleanup_file_logging()
@@ -969,7 +1000,7 @@ class ScrapeCoordinator:
                     self.state.record_source(rec.source_id, crawled=1, saved=1)
                     await session.store_raw_records([rec])
                     # Stream PDF to enrichment as well
-                    asyncio.create_task(self._process_immediate_enrichment(session, [rec]))
+                    self._schedule_enrichment(session, [rec])
 
                 self.state.pdf_saved += len(pdf_records)
                 self.state.urls_crawled += len(pdf_records)
@@ -1010,7 +1041,7 @@ class ScrapeCoordinator:
 
             try:
                 # Fast in-memory dedup first, then DB
-                if record.url in self._visited_urls:
+                if self._visited_urls.contains(record.url):
                     continue
                 if await session.seen_url(record.url):
                     self._visited_urls.add(record.url)
