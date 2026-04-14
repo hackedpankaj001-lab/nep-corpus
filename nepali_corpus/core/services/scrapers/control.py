@@ -157,6 +157,7 @@ class ScrapeCoordinator:
         self._checkpoint_task: Optional[asyncio.Task] = None
         self._enrichment_tasks: Set[asyncio.Task] = set()
         self._enrichment_task_sem = asyncio.Semaphore(max(1, enrichment_workers))
+        self._cache_dir: str = "data/html_cache"  # updated per-run from output_dir
 
     def is_running(self) -> bool:
         return self.state.running
@@ -668,6 +669,14 @@ class ScrapeCoordinator:
         # Preload visited URLs for fast in-memory dedup
         await self._load_visited_urls(session)
 
+        # Set cache dir relative to the run's output directory
+        if output_dir:
+            self._cache_dir = os.path.join(output_dir, "html_cache")
+        elif output_path:
+            self._cache_dir = os.path.join(os.path.dirname(output_path), "html_cache")
+        else:
+            self._cache_dir = "data/html_cache"
+
         jobs = self._build_jobs(categories, max_pages, govt_registry_path, govt_registry_groups, num_sources=num_sources)
 
         # Sort by priority — high-value sources first
@@ -1085,7 +1094,7 @@ class ScrapeCoordinator:
             from nepali_corpus.pipeline.runner import enrich_records
             enriched = enrich_records(
                 records, 
-                cache_dir="data/html_cache",
+                cache_dir=self._cache_dir,
                 ocr_enabled=self._ocr_enabled,
                 pdf_enabled=self._pdf_enabled,
                 max_workers=self._enrichment_workers
@@ -1172,7 +1181,7 @@ class ScrapeCoordinator:
             logger.info("Starting enrichment for %s records...", len(records))
 
             # Run parallel enrichment
-            enriched_pairs = enrich_records(records, cache_dir="data/html_cache")
+            enriched_pairs = enrich_records(records, cache_dir=self._cache_dir)
 
             enriched_records = []
             for rec, content in enriched_pairs:

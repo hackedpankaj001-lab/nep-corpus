@@ -114,8 +114,8 @@ class SQLEnvStorageSession(StorageSession):
         query = """
             INSERT INTO training_documents (
                 id, url, source_id, source_name, language, text,
-                published_at, date_bs, category, province, district, tags
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                published_at, date_bs, category, content_type, province, district, tags
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
             ON CONFLICT (id) DO UPDATE SET
                 url = EXCLUDED.url,
                 source_id = EXCLUDED.source_id,
@@ -125,6 +125,7 @@ class SQLEnvStorageSession(StorageSession):
                 published_at = EXCLUDED.published_at,
                 date_bs = EXCLUDED.date_bs,
                 category = EXCLUDED.category,
+                content_type = EXCLUDED.content_type,
                 province = EXCLUDED.province,
                 district = EXCLUDED.district,
                 tags = EXCLUDED.tags
@@ -140,6 +141,7 @@ class SQLEnvStorageSession(StorageSession):
             doc.published_at,
             doc.date_bs,
             doc.category,
+            doc.content_type or identify_content_type(doc.url),
             doc.province,
             doc.district,
             json.dumps(doc.tags) if doc.tags is not None else None,
