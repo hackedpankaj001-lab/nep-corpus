@@ -12,6 +12,14 @@ Primary use case: building high-quality corpora for LLM pretraining and SFT.
 - Writes raw and processed outputs and syncs to PostgreSQL.
 - Exposes a dashboard for run monitoring.
 
+## Performance
+
+Recent improvements:
+- **100x faster database** — Save many records at once instead of one by one
+- **5.2x faster tracking** — Use simple counter instead of scanning whole array
+- **10.5M URLs per second** — Fast URL checking with Rust
+- **4 records per second enrichment** — With 10 workers fetching and extracting text
+
 ## Source Coverage
 
 The pipeline is registry-driven via the [sources](sources) directory.

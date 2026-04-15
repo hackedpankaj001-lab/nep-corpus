@@ -245,11 +245,6 @@ class SQLEnvStorageSession(StorageSession):
                     json.dumps(self._scrub(rec.raw_meta)) if rec.raw_meta is not None else None,
                 )
             )
-            # Ensure URL is marked as visited in the same flow
-            try:
-                await self.mark_url(rec.url)
-            except Exception:
-                pass
 
         if not args_list:
             return 0
@@ -306,6 +301,26 @@ class SQLEnvStorageSession(StorageSession):
             url_hash,
             url,
         )
+
+    async def seen_urls_batch(self, urls: list) -> set:
+        if self.service._db is None:
+            raise RuntimeError("Database unavailable")
+        hashes = [self._url_hash(u) for u in urls]
+        rows = await self.service._db.fetch(
+            "SELECT url_hash FROM visited_urls WHERE url_hash = ANY($1)", hashes
+        )
+        seen_hashes = {row["url_hash"] for row in rows}
+        return {u for u in urls if self._url_hash(u) in seen_hashes}
+
+    async def mark_urls_batch(self, urls: list) -> None:
+        if self.service._db is None:
+            raise RuntimeError("Database unavailable")
+        args = [(self._url_hash(u), u) for u in urls if u]
+        if args:
+            await self.service._db.executemany(
+                "INSERT INTO visited_urls (url_hash, url) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                args,
+            )
 
     async def count_urls(self) -> int:
         if self.service._db is None:

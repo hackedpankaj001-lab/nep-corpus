@@ -40,12 +40,10 @@ try:
             self._impl.add(url)
 
         def add_many(self, urls: Iterable[str]) -> int:
-            count = 0
-            for url in urls:
-                if url:
-                    self._impl.add(url)
-                    count += 1
-            return count
+            url_list = [u for u in urls if u]
+            if url_list:
+                self._impl.add_many(url_list)
+            return len(url_list)
 
         def contains(self, url: str) -> bool:
             return self._impl.contains(url)

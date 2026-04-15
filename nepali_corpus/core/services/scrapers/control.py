@@ -1037,54 +1037,68 @@ class ScrapeCoordinator:
         pdf_output_dir: str,
         pdf_jobs: List[PdfJob],
     ) -> None:
-        """Centralized processing for scraped records."""
         if not records:
             return
 
-        saved_records = []
-        seen_count = 0
+        t0 = time.perf_counter()
 
+        urls = [r.url for r in records]
+        seen_set = set()
+        try:
+            seen_set = await session.seen_urls_batch(urls)
+        except AttributeError:
+            for u in urls:
+                if await session.seen_url(u):
+                    seen_set.add(u)
+
+        new_records = []
         for record in records:
-            seen_count += 1
             self.state.record_source(record.source_id, crawled=1)
+            if self._visited_urls.contains(record.url) or record.url in seen_set:
+                continue
+            self._visited_urls.add(record.url)
+
+            if pdf_enabled and record.url.lower().endswith(".pdf"):
+                pdf_jobs.append(PdfJob(
+                    url=record.url,
+                    source_id=record.source_id,
+                    source_name=record.source_name,
+                    category=record.category,
+                ))
+                continue
+
+            new_records.append(record)
+
+        if new_records:
+            try:
+                new_urls = [r.url for r in new_records]
+                await session.mark_urls_batch(new_urls)
+            except AttributeError:
+                for u in new_urls:
+                    await session.mark_url(u)
 
             try:
-                # Fast in-memory dedup first, then DB
-                if self._visited_urls.contains(record.url):
-                    continue
-                if await session.seen_url(record.url):
-                    self._visited_urls.add(record.url)
-                    continue
+                await session.store_raw_records(new_records)
+            except Exception as exc:
+                logger.error("Batch store_raw_records failed: %s", exc)
 
-                await session.mark_url(record.url)
-                self._visited_urls.add(record.url)
-
-                # Handle PDF queuing
-                if pdf_enabled and record.url.lower().endswith(".pdf"):
-                    pdf_jobs.append(PdfJob(
-                        url=record.url,
-                        source_id=record.source_id,
-                        source_name=record.source_name,
-                        category=record.category
-                    ))
-                    continue
-
-                # Store and Write
-                await session.store_raw_records([record])
+            for record in new_records:
                 writer.write(record)
-                saved_records.append(record)
                 self.state.record_source(record.source_id, saved=1)
 
-            except Exception as exc:
-                logger.error(f"Failed handling result {record.url}: {exc}")
+        self.state.urls_crawled += len(records)
+        self.state.docs_saved += len(new_records)
 
-        self.state.urls_crawled += seen_count
-        self.state.docs_saved += len(saved_records)
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        rps = len(records) / max((time.perf_counter() - t0), 0.001)
+        logger.debug(
+            "handle_results: %d records in, %d new, %.1fms, %.0f rec/s",
+            len(records), len(new_records), elapsed_ms, rps,
+        )
 
-        # Add to enrichment buffer (batch-triggered)
-        if saved_records:
+        if new_records:
             async with self._enrichment_lock:
-                self._enrichment_buffer.extend(saved_records)
+                self._enrichment_buffer.extend(new_records)
             await self._maybe_flush_enrichment(session)
 
     async def _process_immediate_enrichment(self, session: Any, records: List[RawRecord]) -> None:
@@ -1092,12 +1106,15 @@ class ScrapeCoordinator:
         try:
             # 1. Fetch content
             from nepali_corpus.pipeline.runner import enrich_records
-            enriched = enrich_records(
-                records, 
-                cache_dir=self._cache_dir,
-                ocr_enabled=self._ocr_enabled,
-                pdf_enabled=self._pdf_enabled,
-                max_workers=self._enrichment_workers
+            enriched = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: enrich_records(
+                    records, 
+                    cache_dir=self._cache_dir,
+                    ocr_enabled=self._ocr_enabled,
+                    pdf_enabled=self._pdf_enabled,
+                    max_workers=self._enrichment_workers
+                )
             )
             
             final_docs = []
