@@ -185,7 +185,7 @@ def enrich_records(
 
     def _enrich_one(index: int, rec: RawRecord):
         text = rec.content or rec.summary or ""
-        if len(text) >= min_enrich_len:
+        if min_enrich_len > 0 and len(text) >= min_enrich_len:
             enriched[index] = (rec, None)
         else:
             try:
